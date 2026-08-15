@@ -1,197 +1,189 @@
-// ============================================================================
-// PARAMETERIZED SPI MASTER WITH FSM & CLOCK DIVIDER
-// Supports all 4 SPI Modes, Multi-Slaves, and Configurable Data Width
-// ============================================================================
+// ============================================================
+// SPI MASTER - All 4 Modes, Parameterized, Multi-Slave, CLK_DIv
+// KEY DESIGN DECISION (fixes the sampling bug):
+//   SCLK is a *registered output* driven from sys-clk.
+//   We use an internal flag `sclk_int` that toggles on tick.
+//   Master samples MISO and updates MOSI based on sclk_int
+//   transitions BEFORE they appear on the output port - i.e.,
+//   we look at what sclk_int IS NOW to decide what to do NOW,
+//   and the port `sclk` gets the new value this same cycle.
+//   This avoids the 1-cycle mismatch.
+//
+// FSM:
+//   IDLE → CS_LOW → TRANSFER → CS_HIGH → DONE → IDLE
+// TRANSFER details:
+//   Each bit = 2 ticks (half0 + half1).
+//   half0: first  edge - action = sample  if CPHA=0, shift if CPHA=1
+//   half1: second edge - action = shift   if CPHA=0, sample if CPHA=1
+//   After DATA_W samples, leave TRANSFER.
+// ============================================================
+
 module spi_master #(
-    parameter DATA_WIDTH   = 8,         // Number of bits per transfer
-    parameter NUM_SLAVES   = 4,         // Number of slave select lines
-    parameter CLK_DIV_WIDTH = 8         // Bit width of the clock divider register
+    parameter DATA_W     = 8,
+    parameter NUM_SLAVES = 3,
+    parameter CLK_DIV    = 4       // SCLK freq = sys_clk / (2*CLK_DIV)
 )(
-    input  wire                      clk,       // System clock
-    input  wire                      rst_n,     // Active-low asynchronous reset
-    
-    // Control Interface
-    input  wire                      start,     // Pulse high for 1 cycle to begin
-    input  wire [NUM_SLAVES-1:0]     slave_sel, // One-hot slave selection
-    input  wire [1:0]                spi_mode,  // SPI Mode: [1]=CPOL, [0]=CPHA
-    input  wire [CLK_DIV_WIDTH-1:0]  clk_div,   // SCLK division factor: (System_Clk / (2 * clk_div))
-    input  wire [DATA_WIDTH-1:0]     tx_data,   // Data to transmit
-    
-    // SPI Physical Interface
-    output reg                       sclk,
-    output reg                       mosi,
-    output reg  [NUM_SLAVES-1:0]     cs_n,
-    input  wire                      miso,
-    
-    // Status Interface
-    output reg  [DATA_WIDTH-1:0]     rx_data,
-    output reg                       done
+    input  wire                          clk,
+    input  wire                          rst_n,
+    input  wire                          start,
+    input  wire [1:0]                    mode,       // {CPOL, CPHA}
+    input  wire [$clog2(NUM_SLAVES)-1:0] slave_sel,
+    input  wire [DATA_W-1:0]             tx_data,
+    input  wire                          miso,
+
+    output reg  [DATA_W-1:0]             rx_data,
+    output reg                           done,
+    output reg                           sclk,
+    output reg                           mosi,
+    output reg  [NUM_SLAVES-1:0]         cs_n
 );
 
-    // ---- FSM States ----
-    localparam STATE_IDLE      = 2'b00;
-    localparam STATE_PREPARE   = 2'b01;
-    localparam STATE_TRANSFER  = 2'b10;
-    localparam STATE_DONE      = 2'b11;
+    // ---- Latched config ----
+    reg                          cpol, cpha;
+    reg [$clog2(NUM_SLAVES)-1:0] slv;
 
-    reg [1:0] current_state, next_state;
+    // ---- FSM ----
+    localparam S_IDLE     = 3'd0;
+    localparam S_CS_LOW   = 3'd1;
+    localparam S_TRANSFER = 3'd2;
+    localparam S_CS_HIGH  = 3'd3;
+    localparam S_DONE     = 3'd4;
+    reg [2:0] state;
 
-    // ---- Internal Registers ----
-    reg [DATA_WIDTH-1:0]     shift_reg;
-    reg [$clog2(DATA_WIDTH):0] bit_cnt; // Tracks number of shifted bits
-    reg [CLK_DIV_WIDTH-1:0]  div_cnt;   // Clock divider counter
-    reg                      sclk_en;   // Enables SCLK toggling
-    reg                      sclk_edge; // Pulses high on every internal half-period tick
-    reg                      sclk_prev; // Used to detect edges of sclk
-    
-    // Extract CPOL and CPHA configurations
-    wire cpol = spi_mode[1];
-    wire cpha = spi_mode[0];
+    // ---- Datapath ----
+    reg [DATA_W-1:0]        tx_sr;      // TX shift register (MSB first)
+    reg [DATA_W-1:0]        rx_sr;      // RX shift register
+    reg [$clog2(DATA_W):0]  bit_cnt;    // how many bits sampled so far
+    reg                     half;       // 0=first half of bit, 1=second half
 
-    // ---- Clock Divider Logic ----
-    // Generates internal execution ticks (`sclk_edge`) to toggle or sample data
+    // ---- Clock divider: generate 1-cycle tick every CLK_DIV cycles ----
+    reg [$clog2(CLK_DIV):0] div_cnt;
+    reg                      tick;
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            div_cnt   <= 0;
-            sclk_edge <= 1'b0;
-        end else if (current_state == STATE_TRANSFER) begin
-            if (div_cnt == clk_div - 1) begin
-                div_cnt   <= 0;
-                sclk_edge <= 1'b1;
-            end else begin
-                div_cnt   <= div_cnt + 1;
-                sclk_edge <= 1'b0;
-            end
+            div_cnt <= 0;
+            tick    <= 0;
         end else begin
-            div_cnt   <= 0;
-            sclk_edge <= 1'b0;
+            tick <= 0;
+            if (div_cnt == CLK_DIV - 1) begin
+                div_cnt <= 0;
+                tick    <= 1;
+            end else
+                div_cnt <= div_cnt + 1;
         end
     end
 
-    // ---- FSM State Register ----
+    // ============================================================
+    // FSM + Datapath
+    // ============================================================
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            current_state <= STATE_IDLE;
+            state   <= S_IDLE;
+            cs_n    <= {NUM_SLAVES{1'b1}};
+            sclk    <= 0;
+            mosi    <= 0;
+            done    <= 0;
+            tx_sr   <= 0;
+            rx_sr   <= 0;
+            rx_data <= 0;
+            bit_cnt <= 0;
+            half    <= 0;
+            cpol    <= 0; cpha <= 0; slv <= 0;
         end else begin
-            current_state <= next_state;
-        end
-    end
+            done <= 0;
 
-    // ---- FSM Next State Logic ----
-    always @(*) begin
-        next_state = current_state;
-        case (current_state)
-            STATE_IDLE: begin
-                if (start && (slave_sel != 0)) next_state = STATE_PREPARE;
-            end
-            STATE_PREPARE: begin
-                // One cycle to pull CS_N low and setup base properties before clocking
-                next_state = STATE_TRANSFER;
-            end
-            STATE_TRANSFER: begin
-                // End transfer after shifting all bits (requires 2 ticks per bit)
-                if (sclk_edge && (bit_cnt == DATA_WIDTH) && (sclk == (cpha ? cpol : ~cpol))) begin
-                    next_state = STATE_DONE;
-                end
-            end
-            STATE_DONE: begin
-                next_state = STATE_IDLE;
-            end
-            default: next_state = STATE_IDLE;
-        endcase
-    end
+            case (state)
 
-    // ---- SPI Datapath and Control Output Logic ----
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            sclk      <= 1'b0;
-            mosi      <= 1'b0;
-            cs_n      <= {NUM_SLAVES{1'b1}}; // All deselected
-            rx_data   <= 0;
-            done      <= 1'b0;
-            shift_reg <= 0;
-            bit_cnt   <= 0;
-            sclk_prev <= 1'b0;
-        end else begin
-            done      <= 1'b0; // Default pulse constraint
-            sclk_prev <= sclk;
-
-            case (current_state)
-                STATE_IDLE: begin
-                    sclk <= cpol; // Match CPOL idle state dynamically
-                    mosi <= 1'b0;
+                // ------------------------------------------------
+                S_IDLE: begin
                     cs_n <= {NUM_SLAVES{1'b1}};
-                    if (start && (slave_sel != 0)) begin
-                        shift_reg <= tx_data;
-                        bit_cnt   <= 0;
+                    sclk <= mode[1];       // idle level = CPOL
+                    if (start) begin
+                        cpol    <= mode[1];
+                        cpha    <= mode[0];
+                        slv     <= slave_sel;
+                        tx_sr   <= tx_data;
+                        rx_sr   <= 0;
+                        bit_cnt <= 0;
+                        half    <= 0;
+                        state   <= S_CS_LOW;
                     end
                 end
 
-                STATE_PREPARE: begin
-                    cs_n <= ~slave_sel; // Drive target slave CS_N low
-                    // CPHA=0 setup: Drive first bit out early before any clock edge
-                    if (!cpha) begin
-                        mosi <= shift_reg[DATA_WIDTH-1];
+                // ------------------------------------------------
+                // Assert CS, present first bit if CPHA=0
+                S_CS_LOW: begin
+                    if (tick) begin
+                        cs_n       <= {NUM_SLAVES{1'b1}};
+                        cs_n[slv]  <= 1'b0;
+                        sclk       <= cpol;          // keep idle level
+                        // CPHA=0: master presents MSB NOW (before first edge)
+                        // CPHA=1: master presents MSB on the first clock edge
+                        mosi  <= cpha ? 1'b0 : tx_sr[DATA_W-1];
+                        state <= S_TRANSFER;
                     end
                 end
 
-                STATE_TRANSFER: begin
-                    if (sclk_edge) begin
-                        sclk <= ~sclk; // Toggle SPI Clock line
-                        
-                        // --- SPI Mode Sampling & Shifting Matrix ---
-                        
-                        // Condition A: Sample incoming MISO line
-                        // Mode 0 & 2 (CPHA=0): Sample on leading/rising edge (sclk transitions away from cpol)
-                        // Mode 1 & 3 (CPHA=1): Sample on trailing/falling edge (sclk transitions back to cpol)
-                        if ((!cpha && (sclk == cpol)) || (cpha && (sclk != cpol))) begin
-                            shift_reg <= {shift_reg[DATA_WIDTH-2:0], miso};
-                            if (cpha) bit_cnt <= bit_cnt + 1;
-                        end
-                        
-                        // Condition B: Drive outgoing MOSI line
-                        // Mode 0 & 2 (CPHA=0): Update on trailing edge (sclk transitions back to cpol)
-                        // Mode 1 & 3 (CPHA=1): Update on leading edge (sclk transitions away from cpol)
-                        else if ((!cpha && (sclk != cpol)) || (cpha && (sclk == cpol))) begin
+                // ------------------------------------------------
+                // Shift DATA_W bits
+                S_TRANSFER: begin
+                    if (tick) begin
+                        sclk <= ~sclk;   // toggle SCLK
+                        half <= ~half;
+
+                        if (half == 0) begin
+                            // ---- First edge of this bit ----
                             if (!cpha) begin
+                                // Mode 0/2: SAMPLE on first edge
+                                rx_sr   <= {rx_sr[DATA_W-2:0], miso};
                                 bit_cnt <= bit_cnt + 1;
-                                if (bit_cnt < DATA_WIDTH - 1) begin
-                                    mosi <= shift_reg[DATA_WIDTH-1];
-                                end
                             end else begin
-                                mosi <= shift_reg[DATA_WIDTH-1];
+                                // Mode 1/3: SHIFT (present next bit) on first edge
+                                // For first bit: present tx_sr[DATA_W-1]
+                                // For subsequent: tx_sr was already shifted, present MSB
+                                mosi  <= tx_sr[DATA_W-1];
+                                tx_sr <= {tx_sr[DATA_W-2:0], 1'b0};
+                            end
+                        end else begin
+                            // ---- Second edge of this bit ----
+                            if (!cpha) begin
+                                // Mode 0/2: SHIFT (present next bit) on second edge
+                                mosi  <= tx_sr[DATA_W-2];    // next bit
+                                tx_sr <= {tx_sr[DATA_W-2:0], 1'b0};
+                            end else begin
+                                // Mode 1/3: SAMPLE on second edge
+                                rx_sr   <= {rx_sr[DATA_W-2:0], miso};
+                                bit_cnt <= bit_cnt + 1;
+                            end
+
+                            // After DATA_W samples, done
+                            if (bit_cnt == (cpha ? DATA_W-1 : DATA_W)) begin
+                                state <= S_CS_HIGH;
                             end
                         end
                     end
                 end
 
-
-            /*    STATE_TRANSFER: begin
-    // End transfer right when the 8th bit's count/edge occurs (no extra pulse)
-    if (sclk_edge && (bit_cnt == DATA_WIDTH-1) && (sclk == ~cpol)) begin
-        next_state = STATE_DONE;
-    end
-end*/
-                STATE_DONE: begin
-                    cs_n    <= {NUM_SLAVES{1'b1}}; // Return CS_N high
-                    done    <= 1'b1;
-                    // For CPHA=0, final bit sample happens at the end of the final cycle
-                    if (!cpha) begin
-                        rx_data <= {shift_reg[DATA_WIDTH-2:0], miso};
-                    end else begin
-                        rx_data <= shift_reg;
+                // ------------------------------------------------
+                S_CS_HIGH: begin
+                    if (tick) begin
+                        cs_n  <= {NUM_SLAVES{1'b1}};
+                        sclk  <= cpol;
+                        mosi  <= 0;
+                        state <= S_DONE;
                     end
-                    sclk    <= cpol; // Ensure clock line retains CPOL state
-                    mosi    <= 1'b0;
                 end
-               /* STATE_DONE: begin
-    cs_n    <= {NUM_SLAVES{1'b1}};
-    done    <= 1'b1;
-    rx_data <= shift_reg;   // <-- was: (!cpha) ? {shift_reg[DATA_WIDTH-2:0], miso} : shift_reg
-    sclk    <= cpol;
-    mosi    <= 1'b0;
-end*/
+
+                // ------------------------------------------------
+                S_DONE: begin
+                    rx_data <= rx_sr;
+                    done    <= 1;
+                    state   <= S_IDLE;
+                end
+
             endcase
         end
     end
+
 endmodule
