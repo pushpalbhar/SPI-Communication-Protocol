@@ -1,0 +1,16 @@
+============ SPI V2 Full Test Suite ============
+Mode=0 Slv=0 | M->S: sent=a5 got=a5 PASS | S->M: sent=3c got=3c PASS
+INFO: [USF-XSim-96] XSim completed. Design snapshot 'tb_spi_v2_behav' loaded.
+INFO: [USF-XSim-97] XSim simulation ran for 1000ns
+launch_simulation: Time (s): cpu = 00:00:08 ; elapsed = 00:00:14 . Memory (MB): peak = 5048.035 ; gain = 0.000
+run all
+Mode=0 Slv=1 | M->S: sent=de got=de PASS | S->M: sent=ad got=ad PASS
+Mode=0 Slv=2 | M->S: sent=be got=be PASS | S->M: sent=ef got=ef PASS
+Mode=1 Slv=0 | M->S: sent=12 got=12 PASS | S->M: sent=34 got=34 PASS
+Mode=1 Slv=1 | M->S: sent=ab got=ab PASS | S->M: sent=cd got=cd PASS
+Mode=2 Slv=0 | M->S: sent=56 got=56 PASS | S->M: sent=78 got=78 PASS
+Mode=2 Slv=2 | M->S: sent=f0 got=f0 PASS | S->M: sent=0f got=0f PASS
+Mode=3 Slv=0 | M->S: sent=9a got=9a PASS | S->M: sent=bc got=bc PASS
+Mode=3 Slv=1 | M->S: sent=55 got=55 PASS | S->M: sent=aa got=aa PASS
+================================================
+$finish called at time : 7526 ns : File "C:/Users/Pushpal Bhar/spi_final/spi_final.srcs/sim_1/new/testbench.v" Line 121
